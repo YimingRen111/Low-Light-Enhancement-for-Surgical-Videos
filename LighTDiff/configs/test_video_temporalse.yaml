@@ -1,0 +1,93 @@
+# LighTDiff/configs/test_video_temporalse.yaml  (v1.1)
+name: LighTDiff_Video_TSE_Test
+model_type: LighTDiff
+num_gpu: 1
+manual_seed: 42
+is_train: false
+
+
+datasets:
+  val:
+    name: test
+    type: VideoWindowMP4Dataset
+    phase: val
+    root_lr: E:/ELEC5020/LighTDiff-main/LighTDiff-main/dataset/video/test/low
+    root_hr: E:/ELEC5020/LighTDiff-main/LighTDiff-main/dataset/video/test/high
+    lr_prefix: "lum_contrast"   
+    clip_len: 5
+    center_index: 2
+    crop_size: ~
+    hflip: false
+    vflip: false
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 1
+
+
+train:
+  use_temporal_se: true
+
+
+network_unet:
+  type: TLBNet
+  in_channel: 6
+  out_channel: 3
+  inner_channel: 64
+  norm_groups: 32
+  channel_mults: [1, 2, 4]
+  attn_res: [16]
+  res_blocks: 2
+  dropout: 0.2
+  divide: 16
+  use_tlu: True
+
+network_global_corrector:
+  type: SpatialControlModule
+  normal01: true
+
+network_ddpm:
+  type: GaussianDiffusion
+  image_size: 256
+  channels: 3
+  conditional: true
+  color_limit: -1
+  structure: [1, 2, 2, 2]
+
+ddpm_schedule:
+  schedule: "linear"
+  n_timestep: 2000
+  linear_start: !!float 1e-6
+  linear_end: !!float 1e-2
+
+val:
+  structure: [1, 2, 2, 2]
+  ddim_eta: 1.0
+  ddim_timesteps: 4
+  pred_type: noise
+  suffix: _test
+  save_img: true
+  show_all: true
+  cal_all: true
+  save_video: true
+  # only_save_sr: true
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+    # lpips:
+    #   type: calculate_lpips
+
+
+path:
+  pretrain_network_g: E:/ELEC5020/LighTDiff-main/LighTDiff-main/LighTDiff/experiments/longrun1_run/models/net_g_100000.pth
+  results: E:/ELEC5020/LighTDiff-main/LighTDiff-main/LighTDiff/experiments/longrun1_run/results
+  param_key_g: params
+  strict_load_g: False
+  pretrain_network_d: ~
+  resume_state: ~
+  ignore_resume_networks: ['network_identity']
