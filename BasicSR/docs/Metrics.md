@@ -6,6 +6,56 @@
 
 ## NIQE
 
+## LPIPS
+
+LPIPS (Learned Perceptual Image Patch Similarity) measures perceptual
+distance between two images using deep features.  BasicSR exposes it via the
+``calculate_lpips`` entry in the metric registry once the
+[`lpips`](https://github.com/richzhang/PerceptualSimilarity) package has been
+installed (``pip install lpips``).
+
+To evaluate LPIPS during ``basicsr/test.py`` runs, add it to the ``metrics``
+section of your testing/validation configuration:
+
+```yml
+val:
+  metrics:
+    lpips:
+      type: calculate_lpips
+      net: alex      # optional, defaults to "alex"
+      use_gpu: true  # optional, defaults to True when CUDA is available
+```
+
+With the configuration in place, launch the test script as usual (for example
+``python basicsr/test.py -opt options/test/HiFaceGAN/test_hifacegan.yml``) and
+the LPIPS score will be reported alongside the other metrics.
+
+### Using LPIPS inside LighTDiff
+
+LighTDiff reuses BasicSR's metric registry, so the exact same ``metrics`` block
+from above can be added to your LightDiff YAML configuration.  If you want to
+reuse the LPIPS instance that LightDiff creates during model initialization,
+set ``type: calculate_lpips_lol`` (the wrapper simply forwards to
+``calculate_lpips`` with the cached model).  When running the LightDiff entry
+points on Windows PowerShell, make sure both repositories are on
+``PYTHONPATH`` before launching either ``train.py`` or ``test.py``:
+
+```powershell
+& conda 'shell.powershell' 'hook' | Out-String | Invoke-Expression
+conda activate lightdiff
+$env:PYTHONPATH='E:\ELEC5020\LighTDiff-main\LighTDiff-main\BasicSR;E:\ELEC5020\LighTDiff-main\LighTDiff-main\LighTDiff'
+python LighTDiff\lightdiff\train.py -opt LighTDiff\configs\train_video_temporalse.yaml --force_yml name=longrun1_run
+# For evaluation
+python LighTDiff\lightdiff\test.py -opt LighTDiff\configs\test_video_temporalse.yaml
+```
+
+Any LPIPS entries under ``val.metrics`` (or the top-level ``metrics`` section)
+will then be picked up automatically during training validation and standalone
+testing.  After each run finishes, LightDiff prints the aggregated metric
+values (PSNR, SSIM, LPIPS, etc.) to both the console and the generated log file
+inside ``experiments/<run_name>/log`` so you can confirm LPIPS is being
+calculated.
+
 ## FID
 
 > FID measures the similarity between two datasets of images. It was shown to correlate well with human judgement of visual quality and is most often used to evaluate the quality of samples of Generative Adversarial Networks.

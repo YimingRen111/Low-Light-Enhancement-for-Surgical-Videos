@@ -8,7 +8,9 @@ format and supports optional cropping prior to evaluation.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+
+from typing import Dict, Tuple, Union
+
 
 import numpy as np
 import torch
@@ -47,6 +49,15 @@ def _to_tensor(img: np.ndarray) -> torch.Tensor:
     return tensor
 
 
+
+def _normalize_device(device: Union[None, str, torch.device]) -> Union[None, torch.device]:
+    """Return a ``torch.device`` (or ``None``) given a mixed input type."""
+
+    if device is None:
+        return None
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
 @METRIC_REGISTRY.register()
 def calculate_lpips(
     img: np.ndarray,
@@ -55,6 +66,11 @@ def calculate_lpips(
     input_order: str = 'HWC',
     use_gpu: bool = True,
     net: str = 'alex',
+
+    device: Union[None, str, torch.device] = None,
+    model: Union[None, torch.nn.Module] = None,
+    **_: Union[str, int, float, bool],
+
 ) -> float:
     """Calculate LPIPS (Learned Perceptual Image Patch Similarity).
 
@@ -90,16 +106,59 @@ def calculate_lpips(
     tensor_a = _to_tensor(img)
     tensor_b = _to_tensor(img2)
 
-    if use_gpu and torch.cuda.is_available():
-        device = torch.device('cuda')
+    resolved_device = _normalize_device(device)
+    model_device: Union[None, torch.device] = None
+    if model is not None:
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:  # pragma: no cover - LPIPS has parameters
+            model_device = torch.device('cpu')
+
+    if resolved_device is None:
+        if model_device is not None:
+            resolved_device = model_device
+        elif use_gpu and torch.cuda.is_available():
+            resolved_device = torch.device('cuda')
+        else:
+            resolved_device = torch.device('cpu')
+
+    tensor_a = tensor_a.to(resolved_device)
+    tensor_b = tensor_b.to(resolved_device)
+
+    if model is None:
+        model = _get_lpips_model(net=net, device=resolved_device)
     else:
-        device = torch.device('cpu')
+        if model_device is not None and model_device != resolved_device:
+            model = model.to(resolved_device)
+        model_device = resolved_device
 
-    tensor_a = tensor_a.to(device)
-    tensor_b = tensor_b.to(device)
-
-    model = _get_lpips_model(net=net, device=device)
+    model.eval()
 
     with torch.no_grad():
         distance = model(tensor_a, tensor_b)
     return float(distance.item())
+
+
+@METRIC_REGISTRY.register()
+def calculate_lpips_lol(
+    img: np.ndarray,
+    img2: np.ndarray,
+    device: Union[None, str, torch.device] = None,
+    model: Union[None, torch.nn.Module] = None,
+    **kwargs,
+) -> float:
+    """LightDiff-compatible wrapper around :func:`calculate_lpips`.
+
+    LightDiff stores a pre-constructed LPIPS network inside the model and passes
+    it (together with the expected device) through ``calculate_metric``.  This
+    wrapper reuses that instance when provided, avoiding duplicate GPU memory
+    usage while still supporting the cached fallback used in BasicSR.
+    """
+
+    return calculate_lpips(
+        img=img,
+        img2=img2,
+        device=device,
+        model=model,
+        **kwargs,
+    )

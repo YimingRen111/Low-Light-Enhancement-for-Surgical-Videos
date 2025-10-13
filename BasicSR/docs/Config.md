@@ -196,6 +196,14 @@ val:
       crop_border: 4
       # Whether to convert to Y(CbCr) for validation
       test_y_channel: false
+    # Perceptual metrics such as LPIPS can be enabled the same way.  Specify
+    # the registry key ``calculate_lpips`` and (optionally) override the
+    # backbone network or whether to use CUDA when available.
+    lpips:
+      type: calculate_lpips
+      # Optional LPIPS arguments with their default values shown here.
+      net: alex
+      use_gpu: true
 
 ########################################
 # The following are the logging settings
@@ -329,4 +337,9 @@ val:
       type: calculate_ssim
       crop_border: 4
       test_y_channel: false
+    # Example LPIPS configuration used during validation/testing
+    lpips:
+      type: calculate_lpips
+      net: alex
+      use_gpu: true
 ```
