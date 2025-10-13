@@ -8,7 +8,9 @@ format and supports optional cropping prior to evaluation.
 
 from __future__ import annotations
 
+
 from typing import Dict, Tuple, Union
+
 
 import numpy as np
 import torch
@@ -47,6 +49,7 @@ def _to_tensor(img: np.ndarray) -> torch.Tensor:
     return tensor
 
 
+
 def _normalize_device(device: Union[None, str, torch.device]) -> Union[None, torch.device]:
     """Return a ``torch.device`` (or ``None``) given a mixed input type."""
 
@@ -55,8 +58,6 @@ def _normalize_device(device: Union[None, str, torch.device]) -> Union[None, tor
     if isinstance(device, torch.device):
         return device
     return torch.device(device)
-
-
 @METRIC_REGISTRY.register()
 def calculate_lpips(
     img: np.ndarray,
@@ -65,9 +66,11 @@ def calculate_lpips(
     input_order: str = 'HWC',
     use_gpu: bool = True,
     net: str = 'alex',
+
     device: Union[None, str, torch.device] = None,
     model: Union[None, torch.nn.Module] = None,
     **_: Union[str, int, float, bool],
+
 ) -> float:
     """Calculate LPIPS (Learned Perceptual Image Patch Similarity).
 
