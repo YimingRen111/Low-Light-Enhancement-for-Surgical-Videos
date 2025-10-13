@@ -32,7 +32,9 @@ val:
 ### 在 LighTDiff 中使用 LPIPS
 
 LighTDiff 同样复用了 BasicSR 的度量注册表，因此可以直接把上面的
-``metrics`` 配置复制到 LightDiff 的 YAML 文件里。在 Windows PowerShell 中
+``metrics`` 配置复制到 LightDiff 的 YAML 文件里。如果想复用模型初始化时
+创建的 LPIPS 实例，可以把 ``type`` 设置为 ``calculate_lpips_lol``（该包裹
+函数会把缓存的模型转发给 ``calculate_lpips``）。在 Windows PowerShell 中
 运行训练或测试脚本时，务必先把 BasicSR 与 LighTDiff 两个目录加入
 ``PYTHONPATH``，再启动 ``train.py`` 或 ``test.py``：
 
@@ -46,7 +48,9 @@ python LighTDiff\lightdiff\test.py -opt LighTDiff\configs\test_video_temporalse.
 ```
 
 在 ``val.metrics``（或顶层 ``metrics``）里声明的 LPIPS 指标就会在训练期验证
-以及独立测试脚本中自动计算。
+以及独立测试脚本中自动计算。运行结束后，LightDiff 会在控制台和
+``experiments/<运行名>/log`` 目录下生成的日志文件中同时打印 PSNR、SSIM、
+LPIPS 等聚合指标，方便你确认 LPIPS 已成功参与评测。
 
 ## FID
 

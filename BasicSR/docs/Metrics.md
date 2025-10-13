@@ -33,8 +33,11 @@ the LPIPS score will be reported alongside the other metrics.
 ### Using LPIPS inside LighTDiff
 
 LighTDiff reuses BasicSR's metric registry, so the exact same ``metrics`` block
-from above can be added to your LightDiff YAML configuration.  When running the
-LightDiff entry points on Windows PowerShell, make sure both repositories are on
+from above can be added to your LightDiff YAML configuration.  If you want to
+reuse the LPIPS instance that LightDiff creates during model initialization,
+set ``type: calculate_lpips_lol`` (the wrapper simply forwards to
+``calculate_lpips`` with the cached model).  When running the LightDiff entry
+points on Windows PowerShell, make sure both repositories are on
 ``PYTHONPATH`` before launching either ``train.py`` or ``test.py``:
 
 ```powershell
@@ -48,7 +51,10 @@ python LighTDiff\lightdiff\test.py -opt LighTDiff\configs\test_video_temporalse.
 
 Any LPIPS entries under ``val.metrics`` (or the top-level ``metrics`` section)
 will then be picked up automatically during training validation and standalone
-testing.
+testing.  After each run finishes, LightDiff prints the aggregated metric
+values (PSNR, SSIM, LPIPS, etc.) to both the console and the generated log file
+inside ``experiments/<run_name>/log`` so you can confirm LPIPS is being
+calculated.
 
 ## FID
 
