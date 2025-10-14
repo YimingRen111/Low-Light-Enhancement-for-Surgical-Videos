@@ -120,6 +120,51 @@ def train_pipeline(root_path):
     result = create_train_val_dataloader(opt, logger)
     train_loader, train_sampler, val_loaders, total_epochs, total_iters = result
 
+    # optional early stopping settings
+    early_stop_opt = opt['train'].get('early_stop') if opt.get('train') else None
+    early_stop_state = None
+    if early_stop_opt:
+        if not val_loaders or opt.get('val') is None or opt['val'].get('metrics') is None:
+            logger.warning('`train.early_stop` is set but validation metrics are unavailable; early stopping is disabled.')
+            early_stop_opt = None
+        else:
+            metric_name = early_stop_opt.get('metric')
+            if not metric_name:
+                logger.warning('`train.early_stop.metric` is required; early stopping is disabled.')
+                early_stop_opt = None
+            else:
+                metric_cfg = opt['val']['metrics'].get(metric_name)
+                if metric_cfg is None:
+                    logger.warning('Early stopping metric `%s` is not defined in `val.metrics`; disabling early stopping.',
+                                   metric_name)
+                    early_stop_opt = None
+                else:
+                    better = early_stop_opt.get('better', metric_cfg.get('better', 'higher'))
+                    if better not in ('higher', 'lower'):
+                        logger.warning('Invalid `train.early_stop.better` value `%s`; falling back to `higher`.', better)
+                        better = 'higher'
+                    patience = int(early_stop_opt.get('patience', 5))
+                    min_delta = float(early_stop_opt.get('min_delta', 0.0))
+                    dataset_name = early_stop_opt.get('dataset')
+                    if dataset_name is None and len(val_loaders) > 1:
+                        first_dataset_opt = getattr(val_loaders[0].dataset, 'opt', {})
+                        if isinstance(first_dataset_opt, dict):
+                            dataset_name = first_dataset_opt.get('name', 'val')
+                        else:
+                            dataset_name = 'val'
+                        logger.warning('Multiple validation datasets detected but `train.early_stop.dataset` is not set; '
+                                       'defaulting to `%s`.', dataset_name)
+                    best_val = float('-inf') if better == 'higher' else float('inf')
+                    early_stop_state = dict(metric=metric_name,
+                                            better=better,
+                                            patience=patience,
+                                            min_delta=min_delta,
+                                            dataset=dataset_name,
+                                            best_val=best_val,
+                                            best_iter=-1,
+                                            num_bad_epochs=0,
+                                            triggered=False)
+
     # create model
     model = build_model(opt)
     if resume_state:  # resume training
@@ -151,8 +196,10 @@ def train_pipeline(root_path):
     data_timer, iter_timer = AvgTimer(), AvgTimer()
     start_time = time.time()
 
+    stop_training = False
     for epoch in range(start_epoch, total_epochs + 1):
-        train_sampler.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         prefetcher.reset()
         train_data = prefetcher.next()
 
@@ -190,14 +237,57 @@ def train_pipeline(root_path):
                 if len(val_loaders) > 1:
                     logger.warning('Multiple validation datasets are *only* supported by SRModel.')
                 for val_loader in val_loaders:
+                    dataset_name = val_loader.dataset.opt.get('name', 'val') if hasattr(val_loader.dataset, 'opt') else None
                     model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+                    if early_stop_state and not early_stop_state['triggered']:
+                        target_dataset = early_stop_state['dataset'] or dataset_name
+                        if target_dataset == dataset_name or early_stop_state['dataset'] is None:
+                            metric_results = getattr(model, 'metric_results', None)
+                            if metric_results is None or early_stop_state['metric'] not in metric_results:
+                                logger.warning('Metric results for `%s` are unavailable; disabling early stopping.',
+                                               early_stop_state['metric'])
+                                early_stop_state = None
+                            else:
+                                current_val = float(metric_results[early_stop_state['metric']])
+                                if early_stop_state['better'] == 'higher':
+                                    improved = current_val > (early_stop_state['best_val'] + early_stop_state['min_delta'])
+                                else:
+                                    improved = current_val < (early_stop_state['best_val'] - early_stop_state['min_delta'])
+                                if improved:
+                                    early_stop_state['best_val'] = current_val
+                                    early_stop_state['best_iter'] = current_iter
+                                    early_stop_state['num_bad_epochs'] = 0
+                                else:
+                                    early_stop_state['num_bad_epochs'] += 1
+                                    if early_stop_state['num_bad_epochs'] >= early_stop_state['patience']:
+                                        early_stop_state['triggered'] = True
+                                        stop_training = True
+                                        logger.info(
+                                            'Early stopping triggered at iter %d: %s/%s=%.6f (best %.6f @ iter %d).',
+                                            current_iter,
+                                            dataset_name or 'val',
+                                            early_stop_state['metric'],
+                                            current_val,
+                                            early_stop_state['best_val'],
+                                            early_stop_state['best_iter'])
+                                        break
+                
+                if stop_training:
+                    break
 
             data_timer.start()
             iter_timer.start()
             train_data = prefetcher.next()
+        if stop_training:
+            break
         # end of iter
 
     # end of epoch
+        if stop_training:
+            break
+
+    if early_stop_state and early_stop_state.get('triggered'):
+        logger.info('Training stopped early after reaching patience limit.')
 
     consumed_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info(f'End of training. Time consumed: {consumed_time}')

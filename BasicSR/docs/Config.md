@@ -165,6 +165,20 @@ train:
   # Warm up iterations. -1 indicates no warm up
   warmup_iter: -1
 
+  # (Optional) Early stopping based on validation metrics
+  early_stop:
+    # Metric name defined under `val.metrics`
+    metric: lpips
+    # Whether a higher or lower value is considered better. Falls back to
+    # the metric definition if omitted.
+    better: lower
+    # Number of consecutive validations without improvement before stopping
+    patience: 5
+    # Minimum change required to reset the patience counter
+    min_delta: 0.0005
+    # (Optional) Which validation dataset to watch when multiple are defined
+    dataset: validation
+
   #### The following are loss settings
   # Pixel-wise loss options
   pixel_opt:
@@ -196,6 +210,14 @@ val:
       crop_border: 4
       # Whether to convert to Y(CbCr) for validation
       test_y_channel: false
+    # Perceptual metrics such as LPIPS can be enabled the same way.  Specify
+    # the registry key ``calculate_lpips`` and (optionally) override the
+    # backbone network or whether to use CUDA when available.
+    lpips:
+      type: calculate_lpips
+      # Optional LPIPS arguments with their default values shown here.
+      net: alex
+      use_gpu: true
 
 ########################################
 # The following are the logging settings
@@ -329,4 +351,9 @@ val:
       type: calculate_ssim
       crop_border: 4
       test_y_channel: false
+    # Example LPIPS configuration used during validation/testing
+    lpips:
+      type: calculate_lpips
+      net: alex
+      use_gpu: true
 ```

@@ -201,15 +201,19 @@ class LighTDiff(BaseModel):
                 LR_seq = LR_seq.unsqueeze(0)
             if HR_mid.dim() == 3:  # [3,H,W]
                 HR_mid = HR_mid.unsqueeze(0)
+
+            center = LR_seq.shape[1] // 2
+            center_frame = LR_seq[:, center, ...]
             if self.temporal_se is not None:
                 self.LR = self.temporal_se(LR_seq)  # [B,3,H,W]
             else:
-                center = LR_seq.shape[1] // 2
-                self.LR = LR_seq[:, center, ...]
+                self.LR = center_frame
+            self.lq_vis = center_frame.clone()
             self.HR = HR_mid
         else:
             self.LR = data['LR'].to(self.device)
             self.HR = data['HR'].to(self.device)
+            self.lq_vis = self.LR[:, :3, ...].clone()
 
         # 可选 padding
         for k in ['pad_left', 'pad_right', 'pad_top', 'pad_bottom']:
@@ -523,7 +527,13 @@ class LighTDiff(BaseModel):
             self.HR = F.interpolate(self.HR, self.output.shape[2:])
         out_dict['gt'] = self.HR.detach().cpu()
         out_dict['sr'] = self.output.detach().cpu()
-        out_dict['lq'] = self.LR[:, :3, :, :].detach().cpu()
+
+        lq_src = getattr(self, 'lq_vis', None)
+        if lq_src is None:
+            lq_src = self.LR
+        if lq_src.shape[1] > 3:
+            lq_src = lq_src[:, :3, :, :]
+        out_dict['lq'] = lq_src.detach().cpu()
         return out_dict
 
     def save(self, epoch, current_iter):
