@@ -10,6 +10,25 @@
 1. [Optional] 如果是测试或需要预训练, 则需下载预训练模型, 参见 [模型库](ModelZoo_CN.md)
 1. 运行命令. 根据需要，使用 [训练命令](#训练命令) 或 [测试命令](#测试命令)
 
+## 验证驱动的自动停止
+
+从 BasicSR 现已支持在训练配置中开启 “早停”(early stopping)。当验证集的指定指标在若干次评估内没有改进时，训练会自动终止，避免手动设定过大的 `total_iter`。
+
+在 `train` 区域新增 `early_stop` 即可启用，例如：
+
+```yml
+train:
+  total_iter: 100000
+  early_stop:
+    metric: lpips       # 对应 val.metrics 中的指标名称
+    better: lower       # higher/ lower；若省略则沿用指标默认值
+    patience: 3         # 连续多少次验证无提升后停止
+    min_delta: 0.0005   # 视为“提升”的最小变化幅度
+    dataset: validation # 多个验证集时可指定要观察的名称
+```
+
+如果配置中未设置验证或指定的指标不存在，框架会给出警告并自动忽略早停设置。
+
 #### 目录
 
 1. [训练命令](#训练命令)

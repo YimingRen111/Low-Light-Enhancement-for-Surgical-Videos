@@ -99,11 +99,18 @@ train:
 
   scheduler:
     type: MultiStepLR
-    milestones: [20000, 45000, 90000]
+    milestones: [45000, 90000, 120000]
     gamma: 0.3
 
-  total_iter: 100000
+  total_iter: 150000
   warmup_iter: -1  # no warm up
+
+  early_stop:
+    metric: lpips                 # 监控的指标（需出现在 val.metrics 中）
+    better: lower                 # LPIPS 越低越好
+    patience: 3                   # 连续 3 次没有提升就停止
+    min_delta: 0.0005             # 最小提升幅度
+    dataset: validation           # （可选）指定验证集名称
 
 # ===================== Validation（沿用你原配置） =====================
 val:
@@ -117,7 +124,7 @@ val:
   use_kind_align: false
   cal_all: true
   show_all: true
-  val_freq: !!float 5000
+  val_freq: !!float 4000
   save_img: true
 
 metrics:
@@ -135,7 +142,7 @@ metrics:
 # ===================== Logger / Dist =====================
 logger:
   print_freq: 100
-  save_checkpoint_freq: !!float 5000
+  save_checkpoint_freq: !!float 4000
   use_tb_logger: true
   wandb:
     project: ~
