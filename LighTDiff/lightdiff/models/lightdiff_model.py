@@ -208,12 +208,12 @@ class LighTDiff(BaseModel):
                 self.LR = self.temporal_se(LR_seq)  # [B,3,H,W]
             else:
                 self.LR = center_frame
-            self.lq_vis = center_frame
+            self.lq_vis = center_frame.clone()
             self.HR = HR_mid
         else:
             self.LR = data['LR'].to(self.device)
             self.HR = data['HR'].to(self.device)
-            self.lq_vis = self.LR[:, :3, ...]
+            self.lq_vis = self.LR[:, :3, ...].clone()
 
         # 可选 padding
         for k in ['pad_left', 'pad_right', 'pad_top', 'pad_bottom']:
