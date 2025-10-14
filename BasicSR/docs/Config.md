@@ -165,6 +165,20 @@ train:
   # Warm up iterations. -1 indicates no warm up
   warmup_iter: -1
 
+  # (Optional) Early stopping based on validation metrics
+  early_stop:
+    # Metric name defined under `val.metrics`
+    metric: lpips
+    # Whether a higher or lower value is considered better. Falls back to
+    # the metric definition if omitted.
+    better: lower
+    # Number of consecutive validations without improvement before stopping
+    patience: 5
+    # Minimum change required to reset the patience counter
+    min_delta: 0.0005
+    # (Optional) Which validation dataset to watch when multiple are defined
+    dataset: validation
+
   #### The following are loss settings
   # Pixel-wise loss options
   pixel_opt:

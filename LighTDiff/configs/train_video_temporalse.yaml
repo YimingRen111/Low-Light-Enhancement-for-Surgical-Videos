@@ -105,6 +105,13 @@ train:
   total_iter: 100000
   warmup_iter: -1  # no warm up
 
+  early_stop:
+    metric: lpips                 # 监控的指标（需出现在 val.metrics 中）
+    better: lower                 # LPIPS 越低越好
+    patience: 3                   # 连续 3 次没有提升就停止
+    min_delta: 0.0005             # 最小提升幅度
+    dataset: validation           # （可选）指定验证集名称
+
 # ===================== Validation（沿用你原配置） =====================
 val:
   split_log: false
