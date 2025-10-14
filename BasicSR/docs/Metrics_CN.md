@@ -52,6 +52,19 @@ python LighTDiff\lightdiff\test.py -opt LighTDiff\configs\test_video_temporalse.
 ``experiments/<运行名>/log`` 目录下生成的日志文件中同时打印 PSNR、SSIM、
 LPIPS 等聚合指标，方便你确认 LPIPS 已成功参与评测。
 
+#### 验证阶段的图片与视频输出目录
+
+无论执行 ``basicsr/test.py`` 还是 ``lightdiff/test.py``，最终都会调用
+``LighTDiff`` 的 ``validation`` 方法。当 YAML 中设置 ``val.save_img: true``
+时，每个 mini-batch 都会拼接 ``[LQ | SR | GT]`` 三联图，并写入
+``make_exp_dirs`` 创建的 ``visualization`` 路径：在测试阶段为
+``results/<运行名>/visualization/<数据集名>/``，训练阶段则是
+``experiments/<运行名>/visualization/<数据集名>/``。源码中通过
+``os.path.join(self.opt['path']['visualization'], dataset_name, ...)`` 拼接文件
+名，并在写入前将 LQ、SR、GT 图像沿宽度方向拼接。若 ``val.save_video``
+为 true，同一流程还会借助 ``_VideoSink`` 辅助类把重建帧流式写入
+``results/<运行名>/`` 下的 ``.mp4`` 文件，并额外保存第一帧 PNG 方便对照。
+
 ## FID
 
 > FID measures the similarity between two datasets of images. It was shown to correlate well with human judgement of visual quality and is most often used to evaluate the quality of samples of Generative Adversarial Networks.

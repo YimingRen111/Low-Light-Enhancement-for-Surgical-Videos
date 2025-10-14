@@ -56,6 +56,22 @@ values (PSNR, SSIM, LPIPS, etc.) to both the console and the generated log file
 inside ``experiments/<run_name>/log`` so you can confirm LPIPS is being
 calculated.
 
+#### Where validation outputs are written
+
+During both ``basicsr/test.py`` and ``lightdiff/test.py`` runs, the model
+enters the shared ``validation`` routine defined on ``LighTDiff``.  When the
+``save_img`` flag is enabled (``val.save_img: true`` in your YAML), every
+mini-batch produces an ``[LQ | SR | GT]`` triptych that is saved under the
+``visualization`` directory determined by ``make_exp_dirs``: for testing it is
+``results/<run_name>/visualization/<dataset_name>/``; during training it becomes
+``experiments/<run_name>/visualization/<dataset_name>/``.  You can see this in
+``lightdiff_model.py`` where the filenames are assembled via
+``os.path.join(self.opt['path']['visualization'], dataset_name, ...)`` and the
+images are written with ``imwrite`` after concatenating the low-light input,
+restored frame, and reference frame.  If ``val.save_video`` is true, the same
+method also streams the restored frames into ``.mp4`` files in
+``results/<run_name>/`` using the ``_VideoSink`` helper.
+
 ## FID
 
 > FID measures the similarity between two datasets of images. It was shown to correlate well with human judgement of visual quality and is most often used to evaluate the quality of samples of Generative Adversarial Networks.
