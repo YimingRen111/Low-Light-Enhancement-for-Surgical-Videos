@@ -56,7 +56,8 @@ val:
     # lpips:
     #   type: calculate_lpips
     #   crop_border: 4
-    #   test_y_channel: false
+    #   net: alex        # optional, defaults to "alex"
+    #   use_gpu: true    # optional, defaults to True when CUDA is available
     # niqe:
     #   type: calculate_niqe
     #   crop_border: 4

@@ -79,8 +79,11 @@ val:
       type: calculate_ssim
       crop_border: 0
       test_y_channel: false
-    # lpips:
-    #   type: calculate_lpips
+    lpips:
+      type: calculate_lpips_lol
+      # The LightDiff wrapper reuses the cached LPIPS network that was
+      # instantiated during model construction, so there is no need to pass
+      # extra options here unless you want to switch backbones (e.g. net: vgg).
 
 
 path:
