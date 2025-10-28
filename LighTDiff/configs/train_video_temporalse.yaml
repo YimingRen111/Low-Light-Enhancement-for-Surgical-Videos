@@ -54,6 +54,14 @@ network_unet:
   divide: 16
   use_tlu: True
 
+network_temporal_backbone:
+  type: BasicVSRNet
+  num_feat: 48
+  num_block: 7
+  num_reconstruct_block: 3
+  center_frame_idx: 2
+  residual: true
+
 network_global_corrector:
   type: SpatialControlModule
   normal01: true
@@ -97,6 +105,10 @@ train:
     type: Adam
     lr: !!float 1e-4
 
+  optim_temporal:
+    type: Adam
+    lr: !!float 5e-5
+
   scheduler:
     type: MultiStepLR
     milestones: [45000, 90000, 120000]
@@ -111,6 +123,8 @@ train:
     patience: 3                   # 连续 3 次没有提升就停止
     min_delta: 0.0005             # 最小提升幅度
     dataset: validation           # （可选）指定验证集名称
+
+  temporal_backbone_reg_w: 0.05
 
 # ===================== Validation（沿用你原配置） =====================
 val:

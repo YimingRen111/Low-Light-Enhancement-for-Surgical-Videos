@@ -122,6 +122,16 @@ class LighTDiff(BaseModel):
         else:
             self.temporal_se = None
 
+        # === 额外的时序对齐骨干（BasicVSRNet / EDVR 等） ===
+        self.temporal_backbone = None
+        self.temporal_backbone_center_idx = None
+        temporal_backbone_opt = opt.get('network_temporal_backbone', None)
+        if temporal_backbone_opt:
+            self.temporal_backbone = build_network(temporal_backbone_opt)
+            self.temporal_backbone = self.model_to_device(self.temporal_backbone)
+            self.temporal_backbone_center_idx = temporal_backbone_opt.get('center_frame_idx', None)
+            self.print_network(self.temporal_backbone)
+
         # === 构建网络 ===
         self.unet = build_network(opt['network_unet'])
         self.unet = self.model_to_device(self.unet)
@@ -142,6 +152,8 @@ class LighTDiff(BaseModel):
             schedule_opt=opt['ddpm_schedule'], device=self.device)
         self.bare_model.set_loss(device=self.device)
         self.print_network(self.ddpm)
+
+        self.optimizer_temporal = None
 
         # 载入预训练
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -172,6 +184,8 @@ class LighTDiff(BaseModel):
     # ====== 训练初始化 ====== #
     def init_training_settings(self):
         self.ddpm.train()
+        if self.temporal_backbone is not None:
+            self.temporal_backbone.train()
         self.setup_optimizers()
         self.setup_schedulers()
 
@@ -185,15 +199,29 @@ class LighTDiff(BaseModel):
                 logger.info(f'frozen {name}')
                 continue
             normal_params.append(param)
-        optim_params_g = [{'params': normal_params, 'lr': train_opt['optim_g']['lr']}]
-        optim_type = train_opt['optim_g'].pop('type')
-        lr = float(train_opt['optim_g']['lr'] * net_g_reg_ratio)
+        optim_g_opt = train_opt['optim_g'].copy()
+        optim_params_g = [{'params': normal_params, 'lr': optim_g_opt['lr']}]
+        optim_type = optim_g_opt.pop('type')
+        lr = float(optim_g_opt.pop('lr') * net_g_reg_ratio)
         betas = (0 ** net_g_reg_ratio, 0.99 ** net_g_reg_ratio)
-        self.optimizer_g = self.get_optimizer(optim_type, optim_params_g, lr, betas=betas)
+        self.optimizer_g = self.get_optimizer(optim_type, optim_params_g, lr, betas=betas, **optim_g_opt)
         self.optimizers.append(self.optimizer_g)
+
+        if self.temporal_backbone is not None and train_opt.get('optim_temporal'):
+            temporal_opt = train_opt['optim_temporal'].copy()
+            temporal_type = temporal_opt.pop('type')
+            temporal_lr = temporal_opt.pop('lr')
+            temporal_params = [p for p in self.temporal_backbone.parameters() if p.requires_grad]
+            if temporal_params:
+                optim_params_t = [{'params': temporal_params, 'lr': temporal_lr}]
+                self.optimizer_temporal = self.get_optimizer(
+                    temporal_type, optim_params_t, temporal_lr, **temporal_opt)
+                self.optimizers.append(self.optimizer_temporal)
 
     # ====== 数据喂入（兼容视频/图像） ====== #
     def feed_data(self, data):
+        self.temporal_reg_pred = None
+        self.temporal_reg_target = None
         if 'LR_seq' in data and 'HR_mid' in data:
             LR_seq = data['LR_seq'].to(self.device)
             HR_mid = data['HR_mid'].to(self.device)
@@ -203,11 +231,22 @@ class LighTDiff(BaseModel):
                 HR_mid = HR_mid.unsqueeze(0)
 
             center = LR_seq.shape[1] // 2
+            if self.temporal_backbone_center_idx is not None:
+                center = min(max(int(self.temporal_backbone_center_idx), 0), LR_seq.shape[1] - 1)
             center_frame = LR_seq[:, center, ...]
+            processed_seq = LR_seq
+            if self.temporal_backbone is not None:
+                processed_seq = self.temporal_backbone(processed_seq)
+                if processed_seq.dim() == 4:
+                    processed_seq = processed_seq.unsqueeze(1)
+
             if self.temporal_se is not None:
-                self.LR = self.temporal_se(LR_seq)  # [B,3,H,W]
+                self.LR = self.temporal_se(processed_seq)  # [B,3,H,W]
             else:
-                self.LR = center_frame
+                self.LR = processed_seq[:, center, ...]
+
+            self.temporal_reg_pred = processed_seq[:, center, ...]
+            self.temporal_reg_target = center_frame
             self.lq_vis = center_frame.clone()
             self.HR = HR_mid
         else:
@@ -223,6 +262,8 @@ class LighTDiff(BaseModel):
     # ====== 训练一步 ====== #
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
+        if self.optimizer_temporal is not None:
+            self.optimizer_temporal.zero_grad()
         pred_noise, noise, x_recon_cs, x_start, t, color_scale = self.ddpm(
             self.HR, self.LR,
             train_type=self.opt['train'].get('train_type', None),
@@ -277,14 +318,24 @@ class LighTDiff(BaseModel):
             loss_dict['l_g_noise'] = l_g_noise
             l_g_total += l_g_noise
 
+        temporal_reg_w = float(self.opt['train'].get('temporal_backbone_reg_w', 0.0) or 0.0)
+        if temporal_reg_w > 0 and self.temporal_reg_pred is not None:
+            l_temporal = F.smooth_l1_loss(self.temporal_reg_pred, self.temporal_reg_target) * temporal_reg_w
+            loss_dict['l_temporal'] = l_temporal
+            l_g_total += l_temporal
+
         l_g_total.backward()
         self.optimizer_g.step()
+        if self.optimizer_temporal is not None:
+            self.optimizer_temporal.step()
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
     # ====== 推理 ====== #
     def test(self):
         with torch.no_grad():
             self.bare_model.eval()
+            if self.temporal_backbone is not None:
+                self.temporal_backbone.eval()
             self.output = self.bare_model.ddim_LighT_sample(
                 self.LR,
                 structure=self.opt['val'].get('structure'),
@@ -307,6 +358,8 @@ class LighTDiff(BaseModel):
                 use_up_v2=self.opt['val'].get('use_up_v2', False)
             )
             self.bare_model.train()
+            if self.temporal_backbone is not None:
+                self.temporal_backbone.train()
 
             # 还原 padding
             if hasattr(self, 'pad_left') and not self.opt['val'].get('ret_process', False):

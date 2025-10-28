@@ -40,6 +40,14 @@ network_unet:
   divide: 16
   use_tlu: True
 
+network_temporal_backbone:
+  type: BasicVSRNet
+  num_feat: 48
+  num_block: 7
+  num_reconstruct_block: 3
+  center_frame_idx: 2
+  residual: true
+
 network_global_corrector:
   type: SpatialControlModule
   normal01: true
