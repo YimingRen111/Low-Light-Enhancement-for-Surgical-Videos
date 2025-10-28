@@ -334,3 +334,107 @@ class EDVRFeatureExtractor(nn.Module):
 
         # TSA fusion
         return self.fusion(aligned_feat)
+
+
+@ARCH_REGISTRY.register()
+class BasicVSRNet(nn.Module):
+    """Lightweight BasicVSR variant that keeps the original resolution.
+
+    This module reuses the recurrent propagation design of
+    :class:`BasicVSR` but discards the expensive ×4 upsampling branch.
+    The output is therefore a sequence of temporally aligned frames that
+    share the same spatial size as the input, which is a better fit when the
+    network is used purely as a feature aligner/denoiser.
+    """
+
+    def __init__(
+        self,
+        num_feat=64,
+        num_block=15,
+        num_reconstruct_block=5,
+        center_frame_idx=None,
+        residual=True,
+        spynet_path=None,
+    ):
+        super().__init__()
+        self.num_feat = num_feat
+        self.center_frame_idx = center_frame_idx
+        self.residual = residual
+
+        self.spynet = SpyNet(spynet_path)
+        self.backward_trunk = ConvResidualBlocks(num_feat + 3, num_feat, num_block)
+        self.forward_trunk = ConvResidualBlocks(num_feat + 3, num_feat, num_block)
+
+        self.fusion = nn.Conv2d(num_feat * 2, num_feat, 1, 1, 0, bias=True)
+        self.reconstruction = make_layer(ResidualBlockNoBN, num_reconstruct_block, num_feat=num_feat)
+        self.conv_last = nn.Conv2d(num_feat, 3, 3, 1, 1)
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+
+    def get_flow(self, x):
+        b, n, c, h, w = x.size()
+        x_1 = x[:, :-1, :, :, :].reshape(-1, c, h, w)
+        x_2 = x[:, 1:, :, :, :].reshape(-1, c, h, w)
+
+        flows_backward = self.spynet(x_1, x_2).view(b, n - 1, 2, h, w)
+        flows_forward = self.spynet(x_2, x_1).view(b, n - 1, 2, h, w)
+
+        return flows_forward, flows_backward
+
+    def forward(self, x):
+        """Forward function.
+
+        Args:
+            x (Tensor): Input frames of shape ``(b, n, c, h, w)``.
+
+        Returns:
+            Tensor: Temporally aligned frames with the same spatial size as
+            the input, shape ``(b, n, 3, h, w)``.
+        """
+
+        b, n, _, h, w = x.size()
+        center_idx = n // 2 if self.center_frame_idx is None else self.center_frame_idx
+
+        flows_forward, flows_backward = self.get_flow(x)
+
+        backward_feats = []
+        feat_prop = x.new_zeros(b, self.num_feat, h, w)
+        for i in range(n - 1, -1, -1):
+            x_i = x[:, i, :, :, :]
+            if i < n - 1:
+                flow = flows_backward[:, i, :, :, :]
+                feat_prop = flow_warp(feat_prop, flow.permute(0, 2, 3, 1))
+            feat_prop = torch.cat([x_i, feat_prop], dim=1)
+            feat_prop = self.backward_trunk(feat_prop)
+            backward_feats.insert(0, feat_prop)
+
+        outputs = []
+        feat_prop = torch.zeros_like(feat_prop)
+        for i in range(n):
+            x_i = x[:, i, :, :, :]
+            if i > 0:
+                flow = flows_forward[:, i - 1, :, :, :]
+                feat_prop = flow_warp(feat_prop, flow.permute(0, 2, 3, 1))
+
+            feat_prop = torch.cat([x_i, feat_prop], dim=1)
+            feat_prop = self.forward_trunk(feat_prop)
+
+            out = torch.cat([backward_feats[i], feat_prop], dim=1)
+            out = self.lrelu(self.fusion(out))
+            out = self.reconstruction(out)
+            out = self.conv_last(out)
+
+            if self.residual:
+                out = out + x_i
+            outputs.append(out)
+
+        outputs = torch.stack(outputs, dim=1)
+        if self.training:
+            return outputs
+
+        # During evaluation we only need gradients for the reference frame to
+        # keep the computational graph compact.  We still return the entire
+        # sequence to remain compatible with modules that expect it.
+        detached = outputs.detach()
+        detached[:, center_idx, ...] = outputs[:, center_idx, ...]
+        return detached
