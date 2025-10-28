@@ -4,23 +4,23 @@ num_gpu: 1
 manual_seed: 42
 is_train: true
 
-# ===================== Datasets（直接读取 mp4） =====================
+# ===================== Datasets =====================
 datasets:
   train:
     name: train
-    type: VideoWindowMP4Dataset      # 已在 lightdiff/data/lol_dataset.py 注册
+    type: VideoWindowMP4Dataset
     phase: train
     root_lr: E:/ELEC5020/LighTDiff-main/LighTDiff-main/dataset/video/train/low
     root_hr: E:/ELEC5020/LighTDiff-main/LighTDiff-main/dataset/video/train/high
     lr_prefix: "lum_contrast"
     clip_len: 5
     center_index: 2
-    crop_size: [256, 256]            # 同步裁剪到 256×256
+    crop_size: [256, 256]            
     hflip: true
     vflip: false
     use_shuffle: true
     num_worker_per_gpu: 4
-    batch_size_per_gpu: 1            # 先用1更稳（4070Ti 友好）
+    batch_size_per_gpu: 1            # ok for 4070ti
     prefetch_mode: ~
     pin_memory: false
     persistent_workers: false
@@ -40,7 +40,7 @@ datasets:
     num_worker_per_gpu: 2
     batch_size_per_gpu: 1
 
-# ===================== Networks（沿用你原配置） =====================
+# ===================== Networks =====================
 network_unet:
   type: TLBNet
   in_channel: 6
@@ -80,7 +80,7 @@ ddpm_schedule:
   linear_start: !!float 1e-6
   linear_end: !!float 1e-2
 
-# ===================== Paths（保持与你原来一致） =====================
+# ===================== Paths =====================
 path:
   pretrain_network_g: ~
   param_key_g: params
@@ -88,11 +88,10 @@ path:
   pretrain_network_d: ~
   resume_state: ~
   ignore_resume_networks: ['network_identity']
-  # visualization / experiments_root 等由框架按默认规则生成
 
-# ===================== Train（沿用你原配置 + 打开 Temporal SE） =====================
+# ===================== Train =====================
 train:
-  use_temporal_se: true        # <<<< 开启时间融合（我们新增的）
+  use_temporal_se: true        # <<<< turn on temporal SE module
   cs_on_shift: true
   vis_train: true
   vis_num: 150
@@ -118,15 +117,15 @@ train:
   warmup_iter: -1  # no warm up
 
   early_stop:
-    metric: lpips                 # 监控的指标（需出现在 val.metrics 中）
-    better: lower                 # LPIPS 越低越好
-    patience: 3                   # 连续 3 次没有提升就停止
-    min_delta: 0.0005             # 最小提升幅度
-    dataset: validation           # （可选）指定验证集名称
+    metric: lpips                 
+    better: lower                 
+    patience: 3                   
+    min_delta: 0.0005             
+    dataset: validation           
 
   temporal_backbone_reg_w: 0.05
 
-# ===================== Validation（沿用你原配置） =====================
+# ===================== Validation =====================
 val:
   split_log: false
   fix_seed: true
@@ -147,9 +146,9 @@ metrics:
       crop_border: 0
       test_y_channel: false
     ssim:
-      type: calculate_ssim          # ← 用标准名
-      crop_border: 0                # ← 必填
-      test_y_channel: false         # ← 建议加
+      type: calculate_ssim        
+      crop_border: 0                
+      test_y_channel: false        
     lpips:
       type: calculate_lpips_lol
 
