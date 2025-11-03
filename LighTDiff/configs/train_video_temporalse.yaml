@@ -95,6 +95,7 @@ train:
   cs_on_shift: true
   l_g_lpips_w: 0.1             # 感知损失权重（抑制纹理闪烁）
   l_g_brightness_w: 0.2        # 亮度时间平滑权重
+  l_g_temporal_w: 0.05         # 相邻输出帧光流对齐一致性
   temporal_fusion: aligned_center
   vis_train: true
   vis_num: 150

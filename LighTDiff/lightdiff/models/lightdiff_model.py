@@ -16,6 +16,7 @@ from torchvision.ops import roi_align  # 历史依赖，保留
 from tqdm import tqdm
 
 from basicsr.archs import build_network
+from basicsr.archs.arch_util import flow_warp
 from basicsr.losses import build_loss
 from basicsr.losses.losses import r1_penalty
 from basicsr.metrics import calculate_metric
@@ -191,6 +192,10 @@ class LighTDiff(BaseModel):
             for p in self.lpips.parameters():
                 p.requires_grad_(False)
         self.luma_regularizer_weight = float(self.opt.get('train', {}).get('l_g_brightness_w', 0.0) or 0.0)
+        self.temporal_consistency_weight = float(self.opt.get('train', {}).get('l_g_temporal_w', 0.0) or 0.0)
+
+        self.temporal_sequence = None
+        self.hr_sequence = None
 
         # test 阶段补默认 results 路径
         if 'path' in self.opt and 'results' not in self.opt['path']:
@@ -276,6 +281,8 @@ class LighTDiff(BaseModel):
         self.lr_luma_context = None
         self.lr_luma_center = None
         self.lr_luma_window = None
+        self.temporal_sequence = None
+        self.hr_sequence = None
         if 'LR_seq' in data and 'HR_mid' in data:
             LR_seq = data['LR_seq'].to(self.device)
             HR_mid = data['HR_mid'].to(self.device)
@@ -283,6 +290,11 @@ class LighTDiff(BaseModel):
                 LR_seq = LR_seq.unsqueeze(0)
             if HR_mid.dim() == 3:  # [3,H,W]
                 HR_mid = HR_mid.unsqueeze(0)
+            HR_seq = data.get('HR_seq', None)
+            if HR_seq is not None:
+                HR_seq = HR_seq.to(self.device)
+                if HR_seq.dim() == 4:
+                    HR_seq = HR_seq.unsqueeze(0)
 
             center = LR_seq.shape[1] // 2
             if self.temporal_backbone_center_idx is not None:
@@ -298,6 +310,9 @@ class LighTDiff(BaseModel):
                 processed_seq = self.temporal_backbone(processed_seq)
                 if processed_seq.dim() == 4:
                     processed_seq = processed_seq.unsqueeze(1)
+
+            self.temporal_sequence = processed_seq
+            self.hr_sequence = HR_seq
 
             fusion_mode = self._resolve_temporal_fusion_mode()
             if not self._temporal_fusion_logged:
@@ -357,34 +372,94 @@ class LighTDiff(BaseModel):
             mode = default_mode
         return mode
 
+    def _run_ddpm(self, x_hr, x_lr):
+        train_opt = self.opt['train']
+        return self.ddpm(
+            x_hr,
+            x_lr,
+            train_type=train_opt.get('train_type', None),
+            different_t_in_one_batch=train_opt.get('different_t_in_one_batch', None),
+            t_sample_type=train_opt.get('t_sample_type', None),
+            pred_type=train_opt.get('pred_type', None),
+            clip_noise=train_opt.get('clip_noise', None),
+            color_shift=train_opt.get('color_shift', None),
+            color_shift_with_schedule=train_opt.get('color_shift_with_schedule', None),
+            t_range=train_opt.get('t_range', None),
+            cs_on_shift=train_opt.get('cs_on_shift', None),
+            cs_shift_range=train_opt.get('cs_shift_range', None),
+            t_border=train_opt.get('t_border', None),
+            down_uniform=train_opt.get('down_uniform', False),
+            down_hw_split=train_opt.get('down_hw_split', False),
+            pad_after_crop=train_opt.get('pad_after_crop', False),
+            input_mode=train_opt.get('input_mode', None),
+            crop_size=train_opt.get('crop_size', None),
+            divide=train_opt.get('divide', None),
+            frozen_denoise=train_opt.get('frozen_denoise', None),
+            cs_independent=train_opt.get('cs_independent', None),
+            shift_x_recon_detach=train_opt.get('shift_x_recon_detach', None)
+        )
+
+    def _get_temporal_backbone_core(self):
+        backbone = self.temporal_backbone
+        if isinstance(backbone, (DataParallel, DistributedDataParallel)):
+            backbone = backbone.module
+        return backbone
+
+    def _compute_temporal_consistency(self):
+        if self.temporal_consistency_weight <= 0:
+            return None
+        if self.temporal_sequence is None or self.hr_sequence is None:
+            return None
+
+        seq_lr = self.temporal_sequence
+        seq_hr = self.hr_sequence
+        if seq_lr is None or seq_hr is None:
+            return None
+        if seq_lr.dim() != 5 or seq_hr.dim() != 5:
+            return None
+
+        b, t, c, h, w = seq_lr.shape
+        if t < 2:
+            return None
+
+        seq_lr_flat = seq_lr.reshape(b * t, c, h, w)
+        seq_hr_flat = seq_hr.reshape(b * t, c, h, w)
+        _, _, seq_recon, _, _, _ = self._run_ddpm(seq_hr_flat, seq_lr_flat)
+        seq_recon = seq_recon.view(b, t, c, h, w)
+
+        backbone = self._get_temporal_backbone_core()
+        flows_forward = flows_backward = None
+        if backbone is not None and hasattr(backbone, 'get_flow'):
+            flows_forward, flows_backward = backbone.get_flow(seq_recon)
+
+        temporal_terms = []
+        for i in range(t - 1):
+            cur = seq_recon[:, i, ...]
+            nxt = seq_recon[:, i + 1, ...]
+            if flows_forward is not None and flows_backward is not None:
+                flow_fw = flows_forward[:, i, ...].permute(0, 2, 3, 1)
+                flow_bw = flows_backward[:, i, ...].permute(0, 2, 3, 1)
+                nxt_to_cur = flow_warp(nxt, flow_fw)
+                cur_to_nxt = flow_warp(cur, flow_bw)
+                diff_forward = torch.abs(nxt_to_cur - cur).mean(dim=[1, 2, 3])
+                diff_backward = torch.abs(cur_to_nxt - nxt).mean(dim=[1, 2, 3])
+                pair_loss = 0.5 * (diff_forward + diff_backward)
+            else:
+                pair_loss = torch.abs(cur - nxt).mean(dim=[1, 2, 3])
+            temporal_terms.append(pair_loss)
+
+        if not temporal_terms:
+            return None
+
+        stacked = torch.stack(temporal_terms, dim=0)  # [T-1, B]
+        return stacked.mean()
+
     # ====== 训练一步 ====== #
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         if self.optimizer_temporal is not None:
             self.optimizer_temporal.zero_grad()
-        pred_noise, noise, x_recon_cs, x_start, t, color_scale = self.ddpm(
-            self.HR, self.LR,
-            train_type=self.opt['train'].get('train_type', None),
-            different_t_in_one_batch=self.opt['train'].get('different_t_in_one_batch', None),
-            t_sample_type=self.opt['train'].get('t_sample_type', None),
-            pred_type=self.opt['train'].get('pred_type', None),
-            clip_noise=self.opt['train'].get('clip_noise', None),
-            color_shift=self.opt['train'].get('color_shift', None),
-            color_shift_with_schedule=self.opt['train'].get('color_shift_with_schedule', None),
-            t_range=self.opt['train'].get('t_range', None),
-            cs_on_shift=self.opt['train'].get('cs_on_shift', None),
-            cs_shift_range=self.opt['train'].get('cs_shift_range', None),
-            t_border=self.opt['train'].get('t_border', None),
-            down_uniform=self.opt['train'].get('down_uniform', False),
-            down_hw_split=self.opt['train'].get('down_hw_split', False),
-            pad_after_crop=self.opt['train'].get('pad_after_crop', False),
-            input_mode=self.opt['train'].get('input_mode', None),
-            crop_size=self.opt['train'].get('crop_size', None),
-            divide=self.opt['train'].get('divide', None),
-            frozen_denoise=self.opt['train'].get('frozen_denoise', None),
-            cs_independent=self.opt['train'].get('cs_independent', None),
-            shift_x_recon_detach=self.opt['train'].get('shift_x_recon_detach', None)
-        )
+        pred_noise, noise, x_recon_cs, x_start, t, color_scale = self._run_ddpm(self.HR, self.LR)
 
         # 训练可视
         if self.opt['train'].get('vis_train', False) and \
@@ -436,6 +511,12 @@ class LighTDiff(BaseModel):
             l_brightness = F.mse_loss(pred_luma_mean, target_luma_mean) * self.luma_regularizer_weight
             loss_dict['l_g_brightness'] = l_brightness
             l_g_total += l_brightness
+
+        temporal_consistency = self._compute_temporal_consistency()
+        if temporal_consistency is not None:
+            l_temporal_consistency = temporal_consistency * self.temporal_consistency_weight
+            loss_dict['l_g_temporal_consistency'] = l_temporal_consistency
+            l_g_total += l_temporal_consistency
 
         l_g_total.backward()
         self.optimizer_g.step()

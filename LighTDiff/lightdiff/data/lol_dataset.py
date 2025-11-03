@@ -126,26 +126,29 @@ class VideoWindowMP4Dataset(Dataset):
     def __len__(self):
         return len(self._samples)
 
-    def _sync_random_crop(self, lr_seq, hr_mid):
+    def _sync_random_crop(self, lr_seq, hr_seq, hr_mid):
         if self.crop_size is None:
-            return lr_seq, hr_mid
+            return lr_seq, hr_seq, hr_mid
         _, _, H, W = lr_seq.shape
         ch, cw = int(self.crop_size[0]), int(self.crop_size[1])
         ch = min(ch, H); cw = min(cw, W)
         top = 0 if H == ch else random.randint(0, H - ch)
         left = 0 if W == cw else random.randint(0, W - cw)
         lr_seq = lr_seq[:, :, top:top+ch, left:left+cw]
+        hr_seq = hr_seq[:, :, top:top+ch, left:left+cw]
         hr_mid = hr_mid[:, top:top+ch, left:left+cw]
-        return lr_seq, hr_mid
+        return lr_seq, hr_seq, hr_mid
 
-    def _sync_flip(self, lr_seq, hr_mid):
+    def _sync_flip(self, lr_seq, hr_seq, hr_mid):
         if self.hflip and random.random() < 0.5:
             lr_seq = torch.flip(lr_seq, dims=[3])  # 水平翻转（W维）
+            hr_seq = torch.flip(hr_seq, dims=[3])
             hr_mid = torch.flip(hr_mid, dims=[2])
         if self.vflip and random.random() < 0.5:
             lr_seq = torch.flip(lr_seq, dims=[2])  # 垂直翻转（H维）
+            hr_seq = torch.flip(hr_seq, dims=[2])
             hr_mid = torch.flip(hr_mid, dims=[1])
-        return lr_seq, hr_mid
+        return lr_seq, hr_seq, hr_mid
 
     def __getitem__(self, index):
         vid_idx, t = self._samples[index]
@@ -158,16 +161,18 @@ class VideoWindowMP4Dataset(Dataset):
         half = self.clip_len // 2
         ids = _clamp_indices(t - half, t + half + 1, N)   # 长度 clip_len
         lr_seq = torch.stack([_bgr_to_normed_tensor(lr_frames[i]) for i in ids], dim=0)  # [T,3,H,W]
+        hr_seq = torch.stack([_bgr_to_normed_tensor(hr_frames[i]) for i in ids], dim=0)  # [T,3,H,W]
         hr_mid = _bgr_to_normed_tensor(hr_frames[t])                                      # [3,H,W]
 
         # 同步增强（训练启用，验证关闭）
         phase = self.opt.get('phase', 'train')
         if phase == 'train':
-            lr_seq, hr_mid = self._sync_random_crop(lr_seq, hr_mid)
-            lr_seq, hr_mid = self._sync_flip(lr_seq, hr_mid)
+            lr_seq, hr_seq, hr_mid = self._sync_random_crop(lr_seq, hr_seq, hr_mid)
+            lr_seq, hr_seq, hr_mid = self._sync_flip(lr_seq, hr_seq, hr_mid)
 
         return {
             'LR_seq': lr_seq,        # [T,3,H,W]
             'HR_mid': hr_mid,        # [3,H,W]
+            'HR_seq': hr_seq,        # [T,3,H,W]
             'lq_path': lr_path,    # 供日志/保存名
         }
