@@ -162,15 +162,28 @@ class LighTDiff(BaseModel):
             self.load_network(self.ddpm, load_path,
                               self.opt['path'].get('strict_load_g', True), param_key)
 
-        # LPIPS（仅当配置里请求）
+        # LPIPS（验证与训练共用）
         self.lpips = None
         self.lpips_bare_model = None
         metrics_cfg_check = (self.opt.get('val', {}) or {}).get('metrics') or self.opt.get('metrics')
+        train_lpips_w = float(self.opt.get('train', {}).get('l_g_lpips_w', 0.0) or 0.0)
         if metrics_cfg_check and any('lpips' in m for m in metrics_cfg_check.keys()):
             import lpips
             self.lpips = lpips.LPIPS(net='alex')
             self.lpips = self.model_to_device(self.lpips)
             self.lpips_bare_model = self.lpips.module if isinstance(self.lpips, (DataParallel, DistributedDataParallel)) else self.lpips
+        elif train_lpips_w > 0:
+            import lpips
+            self.lpips = lpips.LPIPS(net=self.opt.get('train', {}).get('lpips_net', 'alex'))
+            self.lpips = self.model_to_device(self.lpips)
+            self.lpips_bare_model = self.lpips.module if isinstance(self.lpips, (DataParallel, DistributedDataParallel)) else self.lpips
+
+        self.lpips_loss_weight = train_lpips_w
+        if self.lpips is not None:
+            self.lpips.eval()
+            for p in self.lpips.parameters():
+                p.requires_grad_(False)
+        self.luma_regularizer_weight = float(self.opt.get('train', {}).get('l_g_brightness_w', 0.0) or 0.0)
 
         # test 阶段补默认 results 路径
         if 'path' in self.opt and 'results' not in self.opt['path']:
@@ -180,6 +193,37 @@ class LighTDiff(BaseModel):
 
         if self.is_train:
             self.init_training_settings()
+
+        # 亮度先验缓存
+        self.lr_luma_context = None
+        self.lr_luma_center = None
+        self.lr_luma_window = None
+
+    @staticmethod
+    def _rgb_to_luma_mean(tensor):
+        """将 [-1,1] 归一化 RGB 张量转换为均值亮度（Y 通道）。"""
+        if tensor.dim() != 4:
+            raise ValueError(f'_rgb_to_luma_mean expects 4D tensor, got shape={tensor.shape}')
+        coeffs = tensor.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)
+        tensor_01 = (tensor + 1.0) * 0.5
+        luma = (tensor_01 * coeffs).sum(dim=1)
+        return luma.mean(dim=[1, 2])
+
+    @staticmethod
+    def _seq_luma_stats(seq, center_idx):
+        """
+        计算输入序列（B,T,3,H,W）的中心亮度与时间窗口平均亮度。
+        返回 (center_mean, window_mean) 均为 [B]。
+        """
+        if seq.dim() != 5:
+            raise ValueError(f'_seq_luma_stats expects 5D tensor, got shape={seq.shape}')
+        coeffs = seq.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 1, 3, 1, 1)
+        seq_01 = (seq + 1.0) * 0.5
+        luma = (seq_01 * coeffs).sum(dim=2)
+        luma_mean = luma.mean(dim=[3, 4])  # [B,T]
+        center = luma_mean[:, center_idx]
+        window = luma_mean.mean(dim=1)
+        return center, window
 
     # ====== 训练初始化 ====== #
     def init_training_settings(self):
@@ -222,6 +266,9 @@ class LighTDiff(BaseModel):
     def feed_data(self, data):
         self.temporal_reg_pred = None
         self.temporal_reg_target = None
+        self.lr_luma_context = None
+        self.lr_luma_center = None
+        self.lr_luma_window = None
         if 'LR_seq' in data and 'HR_mid' in data:
             LR_seq = data['LR_seq'].to(self.device)
             HR_mid = data['HR_mid'].to(self.device)
@@ -235,6 +282,11 @@ class LighTDiff(BaseModel):
                 center = min(max(int(self.temporal_backbone_center_idx), 0), LR_seq.shape[1] - 1)
             center_frame = LR_seq[:, center, ...]
             processed_seq = LR_seq
+            with torch.no_grad():
+                center_luma, window_luma = self._seq_luma_stats(LR_seq, center)
+                self.lr_luma_center = center_luma
+                self.lr_luma_window = window_luma
+                self.lr_luma_context = window_luma
             if self.temporal_backbone is not None:
                 processed_seq = self.temporal_backbone(processed_seq)
                 if processed_seq.dim() == 4:
@@ -253,6 +305,11 @@ class LighTDiff(BaseModel):
             self.LR = data['LR'].to(self.device)
             self.HR = data['HR'].to(self.device)
             self.lq_vis = self.LR[:, :3, ...].clone()
+            with torch.no_grad():
+                center_luma = self._rgb_to_luma_mean(self.lq_vis)
+                self.lr_luma_center = center_luma
+                self.lr_luma_window = center_luma
+                self.lr_luma_context = center_luma
 
         # 可选 padding
         for k in ['pad_left', 'pad_right', 'pad_top', 'pad_bottom']:
@@ -323,6 +380,21 @@ class LighTDiff(BaseModel):
             l_temporal = F.smooth_l1_loss(self.temporal_reg_pred, self.temporal_reg_target) * temporal_reg_w
             loss_dict['l_temporal'] = l_temporal
             l_g_total += l_temporal
+
+        if self.lpips_loss_weight > 0 and self.lpips is not None:
+            lpips_val = self.lpips(x_recon_cs, x_start)
+            if isinstance(lpips_val, (list, tuple)):
+                lpips_val = lpips_val[0]
+            l_lpips = lpips_val.mean() * self.lpips_loss_weight
+            loss_dict['l_g_lpips'] = l_lpips
+            l_g_total += l_lpips
+
+        if self.luma_regularizer_weight > 0 and self.lr_luma_context is not None:
+            pred_luma_mean = self._rgb_to_luma_mean(x_recon_cs)
+            target_luma_mean = self.lr_luma_context.to(pred_luma_mean.device)
+            l_brightness = F.mse_loss(pred_luma_mean, target_luma_mean) * self.luma_regularizer_weight
+            loss_dict['l_g_brightness'] = l_brightness
+            l_g_total += l_brightness
 
         l_g_total.backward()
         self.optimizer_g.step()
