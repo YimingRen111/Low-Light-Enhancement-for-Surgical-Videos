@@ -1,4 +1,4 @@
-import math
+import json
 import os
 import os.path as osp
 import time
@@ -16,6 +16,7 @@ from torchvision.ops import roi_align  # 历史依赖，保留
 from tqdm import tqdm
 
 from basicsr.archs import build_network
+from basicsr.archs.arch_util import flow_warp
 from basicsr.losses import build_loss
 from basicsr.losses.losses import r1_penalty
 from basicsr.metrics import calculate_metric
@@ -122,6 +123,13 @@ class LighTDiff(BaseModel):
         else:
             self.temporal_se = None
 
+        # 融合策略（默认: 有 TemporalSE 时走加权融合，否则取中心帧）
+        self.temporal_fusion_mode_train = opt.get('train', {}).get('temporal_fusion', None)
+        self.temporal_fusion_mode_eval = opt.get('val', {}).get('temporal_fusion', None)
+        if self.temporal_fusion_mode_eval is None:
+            self.temporal_fusion_mode_eval = self.temporal_fusion_mode_train
+        self._temporal_fusion_logged = False
+
         # === 额外的时序对齐骨干（BasicVSRNet / EDVR 等） ===
         self.temporal_backbone = None
         self.temporal_backbone_center_idx = None
@@ -162,15 +170,43 @@ class LighTDiff(BaseModel):
             self.load_network(self.ddpm, load_path,
                               self.opt['path'].get('strict_load_g', True), param_key)
 
-        # LPIPS（仅当配置里请求）
+        # LPIPS（验证与训练共用）
         self.lpips = None
         self.lpips_bare_model = None
         metrics_cfg_check = (self.opt.get('val', {}) or {}).get('metrics') or self.opt.get('metrics')
+        train_lpips_w = float(self.opt.get('train', {}).get('l_g_lpips_w', 0.0) or 0.0)
         if metrics_cfg_check and any('lpips' in m for m in metrics_cfg_check.keys()):
             import lpips
             self.lpips = lpips.LPIPS(net='alex')
             self.lpips = self.model_to_device(self.lpips)
             self.lpips_bare_model = self.lpips.module if isinstance(self.lpips, (DataParallel, DistributedDataParallel)) else self.lpips
+        elif train_lpips_w > 0:
+            import lpips
+            self.lpips = lpips.LPIPS(net=self.opt.get('train', {}).get('lpips_net', 'alex'))
+            self.lpips = self.model_to_device(self.lpips)
+            self.lpips_bare_model = self.lpips.module if isinstance(self.lpips, (DataParallel, DistributedDataParallel)) else self.lpips
+
+        self.lpips_loss_weight = train_lpips_w
+        if self.lpips is not None:
+            self.lpips.eval()
+            for p in self.lpips.parameters():
+                p.requires_grad_(False)
+        self.luma_regularizer_weight = float(self.opt.get('train', {}).get('l_g_brightness_w', 0.0) or 0.0)
+        self.temporal_consistency_weight = float(self.opt.get('train', {}).get('l_g_temporal_w', 0.0) or 0.0)
+
+        self.temporal_sequence = None
+        self.hr_sequence = None
+
+        # === 训练过程统计 & 可视化输出 ===
+        self.rank = int(opt.get('rank', 0) or 0)
+        analytics_dir = osp.join(opt['path'].get('experiments_root', '.'), 'analytics')
+        if self.rank == 0:
+            os.makedirs(analytics_dir, exist_ok=True)
+        self.analytics_dir = analytics_dir
+        self.training_history_path = osp.join(analytics_dir, 'training_history.jsonl')
+        self.validation_history_path = osp.join(analytics_dir, 'validation_history.jsonl')
+        logger_cfg = opt.get('logger', {}) or {}
+        self.analytics_log_interval = int(logger_cfg.get('print_freq', 100) or 1)
 
         # test 阶段补默认 results 路径
         if 'path' in self.opt and 'results' not in self.opt['path']:
@@ -180,6 +216,38 @@ class LighTDiff(BaseModel):
 
         if self.is_train:
             self.init_training_settings()
+
+        # 亮度先验缓存
+        self.lr_luma_context = None
+        self.lr_luma_center = None
+        self.lr_luma_window = None
+
+    @staticmethod
+    def _rgb_to_luma_mean(tensor):
+        """将 [-1,1] 归一化 RGB 张量转换为均值亮度（Y 通道）。"""
+        if tensor.dim() != 4:
+            raise ValueError(f'_rgb_to_luma_mean expects 4D tensor, got shape={tensor.shape}')
+        coeffs = tensor.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)
+        tensor_01 = (tensor + 1.0) * 0.5
+        luma = (tensor_01 * coeffs).sum(dim=1)
+        return luma.mean(dim=[1, 2])
+
+    @staticmethod
+    def _seq_luma_stats(seq, center_idx):
+        """
+        计算输入序列（B,T,3,H,W）的中心亮度与时间窗口平均亮度。
+        返回 (center_mean, window_mean) 均为 [B]。
+        """
+        if seq.dim() != 5:
+            raise ValueError(f'_seq_luma_stats expects 5D tensor, got shape={seq.shape}')
+        coeffs = seq.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 1, 3, 1, 1)
+        seq_01 = (seq + 1.0) * 0.5
+        luma = (seq_01 * coeffs).sum(dim=2)
+        # sum over spatial dims (H, W)
+        luma_mean = luma.mean(dim=[2, 3])  # [B,T]
+        center = luma_mean[:, center_idx]
+        window = luma_mean.mean(dim=1)
+        return center, window
 
     # ====== 训练初始化 ====== #
     def init_training_settings(self):
@@ -222,6 +290,11 @@ class LighTDiff(BaseModel):
     def feed_data(self, data):
         self.temporal_reg_pred = None
         self.temporal_reg_target = None
+        self.lr_luma_context = None
+        self.lr_luma_center = None
+        self.lr_luma_window = None
+        self.temporal_sequence = None
+        self.hr_sequence = None
         if 'LR_seq' in data and 'HR_mid' in data:
             LR_seq = data['LR_seq'].to(self.device)
             HR_mid = data['HR_mid'].to(self.device)
@@ -229,21 +302,55 @@ class LighTDiff(BaseModel):
                 LR_seq = LR_seq.unsqueeze(0)
             if HR_mid.dim() == 3:  # [3,H,W]
                 HR_mid = HR_mid.unsqueeze(0)
+            HR_seq = data.get('HR_seq', None)
+            if HR_seq is not None:
+                HR_seq = HR_seq.to(self.device)
+                if HR_seq.dim() == 4:
+                    HR_seq = HR_seq.unsqueeze(0)
 
             center = LR_seq.shape[1] // 2
             if self.temporal_backbone_center_idx is not None:
                 center = min(max(int(self.temporal_backbone_center_idx), 0), LR_seq.shape[1] - 1)
             center_frame = LR_seq[:, center, ...]
             processed_seq = LR_seq
+            with torch.no_grad():
+                center_luma, window_luma = self._seq_luma_stats(LR_seq, center)
+                self.lr_luma_center = center_luma
+                self.lr_luma_window = window_luma
+                self.lr_luma_context = window_luma
             if self.temporal_backbone is not None:
                 processed_seq = self.temporal_backbone(processed_seq)
                 if processed_seq.dim() == 4:
                     processed_seq = processed_seq.unsqueeze(1)
 
-            if self.temporal_se is not None:
-                self.LR = self.temporal_se(processed_seq)  # [B,3,H,W]
-            else:
+            self.temporal_sequence = processed_seq
+            self.hr_sequence = HR_seq
+
+            fusion_mode = self._resolve_temporal_fusion_mode()
+            if not self._temporal_fusion_logged:
+                backbone_state = 'on' if self.temporal_backbone is not None else 'off'
+                se_state = 'on' if self.temporal_se is not None else 'off'
+                get_root_logger().info(
+                    f"[TemporalFusion] mode={fusion_mode}, backbone={backbone_state}, temporal_se={se_state}"
+                )
+                self._temporal_fusion_logged = True
+
+            if fusion_mode == 'se':
+                if self.temporal_se is None:
+                    get_root_logger().warning(
+                        '[TemporalFusion] temporal_fusion="se" 但 TemporalSE 未启用，退化为 center 模式'
+                    )
+                    self.LR = processed_seq[:, center, ...]
+                else:
+                    self.LR = self.temporal_se(processed_seq)  # [B,3,H,W]
+            elif fusion_mode in {'aligned_center', 'center'}:
+                if fusion_mode == 'aligned_center' and self.temporal_backbone is None:
+                    get_root_logger().warning(
+                        '[TemporalFusion] temporal_fusion="aligned_center" 但未构建时序骨干，退化为 center 模式'
+                    )
                 self.LR = processed_seq[:, center, ...]
+            else:
+                raise ValueError(f'Unsupported temporal fusion mode: {fusion_mode}')
 
             self.temporal_reg_pred = processed_seq[:, center, ...]
             self.temporal_reg_target = center_frame
@@ -253,40 +360,179 @@ class LighTDiff(BaseModel):
             self.LR = data['LR'].to(self.device)
             self.HR = data['HR'].to(self.device)
             self.lq_vis = self.LR[:, :3, ...].clone()
+            with torch.no_grad():
+                center_luma = self._rgb_to_luma_mean(self.lq_vis)
+                self.lr_luma_center = center_luma
+                self.lr_luma_window = center_luma
+                self.lr_luma_context = center_luma
 
         # 可选 padding
         for k in ['pad_left', 'pad_right', 'pad_top', 'pad_bottom']:
             if k in data:
                 setattr(self, k, data[k].to(self.device))
 
+    def _resolve_temporal_fusion_mode(self):
+        default_mode = 'se' if self.temporal_se is not None else 'center'
+        # 训练配置优先；若未指定则尝试验证/测试项
+        if self.opt.get('is_train', False):
+            mode = self.temporal_fusion_mode_train
+            if mode is None:
+                mode = self.temporal_fusion_mode_eval
+        else:
+            mode = self.temporal_fusion_mode_eval
+        if mode is None:
+            mode = default_mode
+        return mode
+
+    def _run_ddpm(self, x_hr, x_lr):
+        train_opt = self.opt['train']
+        return self.ddpm(
+            x_hr,
+            x_lr,
+            train_type=train_opt.get('train_type', None),
+            different_t_in_one_batch=train_opt.get('different_t_in_one_batch', None),
+            t_sample_type=train_opt.get('t_sample_type', None),
+            pred_type=train_opt.get('pred_type', None),
+            clip_noise=train_opt.get('clip_noise', None),
+            color_shift=train_opt.get('color_shift', None),
+            color_shift_with_schedule=train_opt.get('color_shift_with_schedule', None),
+            t_range=train_opt.get('t_range', None),
+            cs_on_shift=train_opt.get('cs_on_shift', None),
+            cs_shift_range=train_opt.get('cs_shift_range', None),
+            t_border=train_opt.get('t_border', None),
+            down_uniform=train_opt.get('down_uniform', False),
+            down_hw_split=train_opt.get('down_hw_split', False),
+            pad_after_crop=train_opt.get('pad_after_crop', False),
+            input_mode=train_opt.get('input_mode', None),
+            crop_size=train_opt.get('crop_size', None),
+            divide=train_opt.get('divide', None),
+            frozen_denoise=train_opt.get('frozen_denoise', None),
+            cs_independent=train_opt.get('cs_independent', None),
+            shift_x_recon_detach=train_opt.get('shift_x_recon_detach', None)
+        )
+
+    def _get_temporal_backbone_core(self):
+        backbone = self.temporal_backbone
+        if isinstance(backbone, (DataParallel, DistributedDataParallel)):
+            backbone = backbone.module
+        return backbone
+
+    def _append_jsonl(self, path, record):
+        if self.rank != 0:
+            return
+        if path is None:
+            return
+        try:
+            with open(path, 'a', encoding='utf-8') as f:
+                json.dump(record, f, ensure_ascii=False)
+                f.write('\n')
+        except Exception as exc:
+            get_root_logger().warning(f'Failed to write analytics record to {path}: {exc}')
+
+    def _record_training_history(self, current_iter, log_dict):
+        if self.rank != 0:
+            return
+        interval = max(1, self.analytics_log_interval)
+        if current_iter % interval != 0:
+            return
+
+        record = {
+            'iter': int(current_iter),
+            'timestamp': time.time(),
+        }
+        try:
+            lrs = self.get_current_learning_rate()
+        except Exception:
+            lrs = []
+        for idx, lr in enumerate(lrs):
+            record[f'lr_{idx}'] = float(lr)
+
+        for key, value in (log_dict or {}).items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.item()
+            record[key] = float(value)
+
+        self._append_jsonl(self.training_history_path, record)
+
+    def _record_validation_history(self, current_iter, dataset_name, metrics):
+        if self.rank != 0:
+            return
+        record = {
+            'iter': int(current_iter),
+            'dataset': dataset_name,
+            'timestamp': time.time(),
+        }
+        for key, value in (metrics or {}).items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.item()
+            record[key] = float(value)
+        self._append_jsonl(self.validation_history_path, record)
+
+    def _compute_temporal_consistency(self):
+        if self.temporal_consistency_weight <= 0:
+            return None
+        if self.temporal_sequence is None or self.hr_sequence is None:
+            return None
+
+        seq_lr = self.temporal_sequence
+        seq_hr = self.hr_sequence
+        if seq_lr is None or seq_hr is None:
+            return None
+        if seq_lr.dim() != 5 or seq_hr.dim() != 5:
+            return None
+
+        b, t, c, h, w = seq_lr.shape
+        if t < 2:
+            return None
+
+        seq_lr_flat = seq_lr.reshape(b * t, c, h, w)
+        seq_hr_flat = seq_hr.reshape(b * t, c, h, w)
+        _, _, seq_recon, _, _, _ = self._run_ddpm(seq_hr_flat, seq_lr_flat)
+
+        bt, c_rec, h_rec, w_rec = seq_recon.shape
+        if bt != b * t:
+            raise RuntimeError(
+                f"Temporal consistency expects {b * t} frames but got {bt} from DDPM"
+            )
+        seq_recon = seq_recon.view(b, t, c_rec, h_rec, w_rec)
+
+        backbone = self._get_temporal_backbone_core()
+        flows_forward = flows_backward = None
+        if backbone is not None and hasattr(backbone, 'get_flow'):
+            flows_forward, flows_backward = backbone.get_flow(seq_recon)
+
+        temporal_terms = []
+        for i in range(t - 1):
+            cur = seq_recon[:, i, ...]
+            nxt = seq_recon[:, i + 1, ...]
+            if flows_forward is not None and flows_backward is not None:
+                flow_fw = flows_forward[:, i, ...].permute(0, 2, 3, 1)
+                flow_bw = flows_backward[:, i, ...].permute(0, 2, 3, 1)
+                nxt_to_cur = flow_warp(nxt, flow_fw)
+                cur_to_nxt = flow_warp(cur, flow_bw)
+                diff_forward = torch.abs(nxt_to_cur - cur).mean(dim=[1, 2, 3])
+                diff_backward = torch.abs(cur_to_nxt - nxt).mean(dim=[1, 2, 3])
+                pair_loss = 0.5 * (diff_forward + diff_backward)
+            else:
+                pair_loss = torch.abs(cur - nxt).mean(dim=[1, 2, 3])
+            temporal_terms.append(pair_loss)
+
+        if not temporal_terms:
+            return None
+
+        stacked = torch.stack(temporal_terms, dim=0)  # [T-1, B]
+        return stacked.mean()
+
     # ====== 训练一步 ====== #
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         if self.optimizer_temporal is not None:
             self.optimizer_temporal.zero_grad()
-        pred_noise, noise, x_recon_cs, x_start, t, color_scale = self.ddpm(
-            self.HR, self.LR,
-            train_type=self.opt['train'].get('train_type', None),
-            different_t_in_one_batch=self.opt['train'].get('different_t_in_one_batch', None),
-            t_sample_type=self.opt['train'].get('t_sample_type', None),
-            pred_type=self.opt['train'].get('pred_type', None),
-            clip_noise=self.opt['train'].get('clip_noise', None),
-            color_shift=self.opt['train'].get('color_shift', None),
-            color_shift_with_schedule=self.opt['train'].get('color_shift_with_schedule', None),
-            t_range=self.opt['train'].get('t_range', None),
-            cs_on_shift=self.opt['train'].get('cs_on_shift', None),
-            cs_shift_range=self.opt['train'].get('cs_shift_range', None),
-            t_border=self.opt['train'].get('t_border', None),
-            down_uniform=self.opt['train'].get('down_uniform', False),
-            down_hw_split=self.opt['train'].get('down_hw_split', False),
-            pad_after_crop=self.opt['train'].get('pad_after_crop', False),
-            input_mode=self.opt['train'].get('input_mode', None),
-            crop_size=self.opt['train'].get('crop_size', None),
-            divide=self.opt['train'].get('divide', None),
-            frozen_denoise=self.opt['train'].get('frozen_denoise', None),
-            cs_independent=self.opt['train'].get('cs_independent', None),
-            shift_x_recon_detach=self.opt['train'].get('shift_x_recon_detach', None)
-        )
+        pred_noise, noise, x_recon_cs, x_start, t, color_scale = self._run_ddpm(self.HR, self.LR)
 
         # 训练可视
         if self.opt['train'].get('vis_train', False) and \
@@ -324,11 +570,33 @@ class LighTDiff(BaseModel):
             loss_dict['l_temporal'] = l_temporal
             l_g_total += l_temporal
 
+        if self.lpips_loss_weight > 0 and self.lpips is not None:
+            lpips_val = self.lpips(x_recon_cs, x_start)
+            if isinstance(lpips_val, (list, tuple)):
+                lpips_val = lpips_val[0]
+            l_lpips = lpips_val.mean() * self.lpips_loss_weight
+            loss_dict['l_g_lpips'] = l_lpips
+            l_g_total += l_lpips
+
+        if self.luma_regularizer_weight > 0 and self.lr_luma_context is not None:
+            pred_luma_mean = self._rgb_to_luma_mean(x_recon_cs)
+            target_luma_mean = self.lr_luma_context.to(pred_luma_mean.device)
+            l_brightness = F.mse_loss(pred_luma_mean, target_luma_mean) * self.luma_regularizer_weight
+            loss_dict['l_g_brightness'] = l_brightness
+            l_g_total += l_brightness
+
+        temporal_consistency = self._compute_temporal_consistency()
+        if temporal_consistency is not None:
+            l_temporal_consistency = temporal_consistency * self.temporal_consistency_weight
+            loss_dict['l_g_temporal_consistency'] = l_temporal_consistency
+            l_g_total += l_temporal_consistency
+
         l_g_total.backward()
         self.optimizer_g.step()
         if self.optimizer_temporal is not None:
             self.optimizer_temporal.step()
         self.log_dict = self.reduce_loss_dict(loss_dict)
+        self._record_training_history(current_iter, self.log_dict)
 
     # ====== 推理 ====== #
     def test(self):
@@ -555,10 +823,11 @@ class LighTDiff(BaseModel):
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
         logger = get_root_logger()
-        log_str = f'Validation {dataset_name}\n'
+        log_str = f'Validation {dataset_name} @ iter {current_iter}\n'
         for metric, value in self.metric_results.items():
             log_str += f'\t # {metric}: {value:.4f}\n'
         logger.info(log_str)
+        self._record_validation_history(current_iter, dataset_name, self.metric_results)
 
         if self.opt['val'].get('split_log', False):
             for ds_name, num in zip(['LOL', 'REAL', 'SYNC'], [15, 100, 100]):
@@ -567,6 +836,7 @@ class LighTDiff(BaseModel):
                     for metric, value in self.split_results[ds_name].items():
                         log_str += f'\t # {metric}: {value/num:.4f}\n'
                     logger.info(log_str)
+                    self._record_validation_history(current_iter, ds_name, {k: v / num for k, v in self.split_results[ds_name].items()})
 
         if tb_logger:
             for metric, value in self.metric_results.items():
