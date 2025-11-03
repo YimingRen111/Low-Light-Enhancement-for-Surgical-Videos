@@ -114,10 +114,11 @@ train:
 
   scheduler:
     type: MultiStepLR
-    milestones: [45000, 90000, 120000]
+    milestones: [75000, 150000, 200000]
     gamma: 0.3
 
-  total_iter: 150000
+  # 默认总迭代次数，长程训练可酌情放大
+  total_iter: 250000
   warmup_iter: -1  # no warm up
 
   early_stop:
@@ -142,7 +143,8 @@ val:
   use_kind_align: false
   cal_all: true
   show_all: true
-  val_freq: !!float 4000
+  # 长程训练建议与 checkpoint 频率保持一致
+  val_freq: !!float 5000
   save_img: true
 
 metrics:
@@ -160,7 +162,7 @@ metrics:
 # ===================== Logger / Dist =====================
 logger:
   print_freq: 100
-  save_checkpoint_freq: !!float 4000
+  save_checkpoint_freq: !!float 5000
   use_tb_logger: true
   wandb:
     project: ~

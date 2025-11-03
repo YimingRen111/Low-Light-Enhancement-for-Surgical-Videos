@@ -1,4 +1,4 @@
-import math
+import json
 import os
 import os.path as osp
 import time
@@ -196,6 +196,17 @@ class LighTDiff(BaseModel):
 
         self.temporal_sequence = None
         self.hr_sequence = None
+
+        # === 训练过程统计 & 可视化输出 ===
+        self.rank = int(opt.get('rank', 0) or 0)
+        analytics_dir = osp.join(opt['path'].get('experiments_root', '.'), 'analytics')
+        if self.rank == 0:
+            os.makedirs(analytics_dir, exist_ok=True)
+        self.analytics_dir = analytics_dir
+        self.training_history_path = osp.join(analytics_dir, 'training_history.jsonl')
+        self.validation_history_path = osp.join(analytics_dir, 'validation_history.jsonl')
+        logger_cfg = opt.get('logger', {}) or {}
+        self.analytics_log_interval = int(logger_cfg.get('print_freq', 100) or 1)
 
         # test 阶段补默认 results 路径
         if 'path' in self.opt and 'results' not in self.opt['path']:
@@ -406,6 +417,61 @@ class LighTDiff(BaseModel):
             backbone = backbone.module
         return backbone
 
+    def _append_jsonl(self, path, record):
+        if self.rank != 0:
+            return
+        if path is None:
+            return
+        try:
+            with open(path, 'a', encoding='utf-8') as f:
+                json.dump(record, f, ensure_ascii=False)
+                f.write('\n')
+        except Exception as exc:
+            get_root_logger().warning(f'Failed to write analytics record to {path}: {exc}')
+
+    def _record_training_history(self, current_iter, log_dict):
+        if self.rank != 0:
+            return
+        interval = max(1, self.analytics_log_interval)
+        if current_iter % interval != 0:
+            return
+
+        record = {
+            'iter': int(current_iter),
+            'timestamp': time.time(),
+        }
+        try:
+            lrs = self.get_current_learning_rate()
+        except Exception:
+            lrs = []
+        for idx, lr in enumerate(lrs):
+            record[f'lr_{idx}'] = float(lr)
+
+        for key, value in (log_dict or {}).items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.item()
+            record[key] = float(value)
+
+        self._append_jsonl(self.training_history_path, record)
+
+    def _record_validation_history(self, current_iter, dataset_name, metrics):
+        if self.rank != 0:
+            return
+        record = {
+            'iter': int(current_iter),
+            'dataset': dataset_name,
+            'timestamp': time.time(),
+        }
+        for key, value in (metrics or {}).items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.item()
+            record[key] = float(value)
+        self._append_jsonl(self.validation_history_path, record)
+
     def _compute_temporal_consistency(self):
         if self.temporal_consistency_weight <= 0:
             return None
@@ -530,6 +596,7 @@ class LighTDiff(BaseModel):
         if self.optimizer_temporal is not None:
             self.optimizer_temporal.step()
         self.log_dict = self.reduce_loss_dict(loss_dict)
+        self._record_training_history(current_iter, self.log_dict)
 
     # ====== 推理 ====== #
     def test(self):
@@ -756,10 +823,11 @@ class LighTDiff(BaseModel):
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
         logger = get_root_logger()
-        log_str = f'Validation {dataset_name}\n'
+        log_str = f'Validation {dataset_name} @ iter {current_iter}\n'
         for metric, value in self.metric_results.items():
             log_str += f'\t # {metric}: {value:.4f}\n'
         logger.info(log_str)
+        self._record_validation_history(current_iter, dataset_name, self.metric_results)
 
         if self.opt['val'].get('split_log', False):
             for ds_name, num in zip(['LOL', 'REAL', 'SYNC'], [15, 100, 100]):
@@ -768,6 +836,7 @@ class LighTDiff(BaseModel):
                     for metric, value in self.split_results[ds_name].items():
                         log_str += f'\t # {metric}: {value/num:.4f}\n'
                     logger.info(log_str)
+                    self._record_validation_history(current_iter, ds_name, {k: v / num for k, v in self.split_results[ds_name].items()})
 
         if tb_logger:
             for metric, value in self.metric_results.items():
