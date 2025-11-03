@@ -232,7 +232,8 @@ class LighTDiff(BaseModel):
         coeffs = seq.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 1, 3, 1, 1)
         seq_01 = (seq + 1.0) * 0.5
         luma = (seq_01 * coeffs).sum(dim=2)
-        luma_mean = luma.mean(dim=[3, 4])  # [B,T]
+        # sum over spatial dims (H, W)
+        luma_mean = luma.mean(dim=[2, 3])  # [B,T]
         center = luma_mean[:, center_idx]
         window = luma_mean.mean(dim=1)
         return center, window
