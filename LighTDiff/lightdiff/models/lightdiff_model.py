@@ -122,6 +122,13 @@ class LighTDiff(BaseModel):
         else:
             self.temporal_se = None
 
+        # 融合策略（默认: 有 TemporalSE 时走加权融合，否则取中心帧）
+        self.temporal_fusion_mode_train = opt.get('train', {}).get('temporal_fusion', None)
+        self.temporal_fusion_mode_eval = opt.get('val', {}).get('temporal_fusion', None)
+        if self.temporal_fusion_mode_eval is None:
+            self.temporal_fusion_mode_eval = self.temporal_fusion_mode_train
+        self._temporal_fusion_logged = False
+
         # === 额外的时序对齐骨干（BasicVSRNet / EDVR 等） ===
         self.temporal_backbone = None
         self.temporal_backbone_center_idx = None
@@ -292,10 +299,31 @@ class LighTDiff(BaseModel):
                 if processed_seq.dim() == 4:
                     processed_seq = processed_seq.unsqueeze(1)
 
-            if self.temporal_se is not None:
-                self.LR = self.temporal_se(processed_seq)  # [B,3,H,W]
-            else:
+            fusion_mode = self._resolve_temporal_fusion_mode()
+            if not self._temporal_fusion_logged:
+                backbone_state = 'on' if self.temporal_backbone is not None else 'off'
+                se_state = 'on' if self.temporal_se is not None else 'off'
+                get_root_logger().info(
+                    f"[TemporalFusion] mode={fusion_mode}, backbone={backbone_state}, temporal_se={se_state}"
+                )
+                self._temporal_fusion_logged = True
+
+            if fusion_mode == 'se':
+                if self.temporal_se is None:
+                    get_root_logger().warning(
+                        '[TemporalFusion] temporal_fusion="se" 但 TemporalSE 未启用，退化为 center 模式'
+                    )
+                    self.LR = processed_seq[:, center, ...]
+                else:
+                    self.LR = self.temporal_se(processed_seq)  # [B,3,H,W]
+            elif fusion_mode in {'aligned_center', 'center'}:
+                if fusion_mode == 'aligned_center' and self.temporal_backbone is None:
+                    get_root_logger().warning(
+                        '[TemporalFusion] temporal_fusion="aligned_center" 但未构建时序骨干，退化为 center 模式'
+                    )
                 self.LR = processed_seq[:, center, ...]
+            else:
+                raise ValueError(f'Unsupported temporal fusion mode: {fusion_mode}')
 
             self.temporal_reg_pred = processed_seq[:, center, ...]
             self.temporal_reg_target = center_frame
@@ -315,6 +343,19 @@ class LighTDiff(BaseModel):
         for k in ['pad_left', 'pad_right', 'pad_top', 'pad_bottom']:
             if k in data:
                 setattr(self, k, data[k].to(self.device))
+
+    def _resolve_temporal_fusion_mode(self):
+        default_mode = 'se' if self.temporal_se is not None else 'center'
+        # 训练配置优先；若未指定则尝试验证/测试项
+        if self.opt.get('is_train', False):
+            mode = self.temporal_fusion_mode_train
+            if mode is None:
+                mode = self.temporal_fusion_mode_eval
+        else:
+            mode = self.temporal_fusion_mode_eval
+        if mode is None:
+            mode = default_mode
+        return mode
 
     # ====== 训练一步 ====== #
     def optimize_parameters(self, current_iter):
