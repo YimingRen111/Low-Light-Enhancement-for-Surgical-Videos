@@ -426,7 +426,13 @@ class LighTDiff(BaseModel):
         seq_lr_flat = seq_lr.reshape(b * t, c, h, w)
         seq_hr_flat = seq_hr.reshape(b * t, c, h, w)
         _, _, seq_recon, _, _, _ = self._run_ddpm(seq_hr_flat, seq_lr_flat)
-        seq_recon = seq_recon.view(b, t, c, h, w)
+
+        bt, c_rec, h_rec, w_rec = seq_recon.shape
+        if bt != b * t:
+            raise RuntimeError(
+                f"Temporal consistency expects {b * t} frames but got {bt} from DDPM"
+            )
+        seq_recon = seq_recon.view(b, t, c_rec, h_rec, w_rec)
 
         backbone = self._get_temporal_backbone_core()
         flows_forward = flows_backward = None
